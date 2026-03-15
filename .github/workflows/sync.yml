@@ -1,0 +1,151 @@
+name: Sync Directory
+
+on:
+  schedule:
+    - cron: "0 */6 * * *" # Every 6 hours
+  workflow_dispatch: # Manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Discover gitizen repos
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Searching for gitizen repos..."
+
+          # Collect all users across pages (API returns max 1000)
+          ALL_USERS="[]"
+          PAGE=1
+
+          while true; do
+            RESULT=$(gh api "search/repositories?q=topic:gitizen+fork:false&sort=created&order=asc&per_page=100&page=$PAGE" \
+              --jq '.items[] | {
+                github: .owner.login,
+                name: (.owner.login),
+                type: "human",
+                joined: (.created_at | split("T")[0]),
+                description: (.description // ""),
+                stars: .stargazers_count
+              }' 2>/dev/null | jq -s '.')
+
+            COUNT=$(echo "$RESULT" | jq 'length')
+            echo "Page $PAGE: found $COUNT repos"
+
+            if [ "$COUNT" -eq 0 ]; then
+              break
+            fi
+
+            ALL_USERS=$(echo "$ALL_USERS $RESULT" | jq -s 'add')
+            PAGE=$((PAGE + 1))
+
+            # GitHub search API hard limit
+            if [ $PAGE -gt 10 ]; then
+              break
+            fi
+          done
+
+          TOTAL=$(echo "$ALL_USERS" | jq 'length')
+          echo "Total users found: $TOTAL"
+
+          # For each user, try to read their profile.json for richer data
+          ENRICHED="[]"
+          for USERNAME in $(echo "$ALL_USERS" | jq -r '.[].github'); do
+            PROFILE=$(gh api "repos/$USERNAME/gitizen/contents/profile.json" \
+              --jq '.content' 2>/dev/null | base64 -d 2>/dev/null || echo "")
+
+            if [ -n "$PROFILE" ]; then
+              NAME=$(echo "$PROFILE" | jq -r '.name // empty' 2>/dev/null || echo "")
+              TYPE=$(echo "$PROFILE" | jq -r '.type // "human"' 2>/dev/null || echo "human")
+              BIO=$(echo "$PROFILE" | jq -r '.bio // ""' 2>/dev/null || echo "")
+              CREATED=$(echo "$PROFILE" | jq -r '.created // empty' 2>/dev/null || echo "")
+            else
+              NAME=""
+              TYPE="human"
+              BIO=""
+              CREATED=""
+            fi
+
+            # Get join date from search results as fallback
+            SEARCH_JOINED=$(echo "$ALL_USERS" | jq -r --arg u "$USERNAME" '.[] | select(.github == $u) | .joined')
+            STARS=$(echo "$ALL_USERS" | jq -r --arg u "$USERNAME" '.[] | select(.github == $u) | .stars')
+
+            ENTRY=$(jq -n \
+              --arg github "$USERNAME" \
+              --arg name "${NAME:-$USERNAME}" \
+              --arg type "$TYPE" \
+              --arg bio "$BIO" \
+              --arg joined "${CREATED:-$SEARCH_JOINED}" \
+              --argjson stars "${STARS:-0}" \
+              '{github: $github, name: $name, type: $type, bio: $bio, joined: $joined, stars: $stars}')
+
+            ENRICHED=$(echo "$ENRICHED" | jq --argjson entry "$ENTRY" '. + [$entry]')
+          done
+
+          # Sort by join date
+          ENRICHED=$(echo "$ENRICHED" | jq 'sort_by(.joined)')
+
+          # Write index.json
+          TODAY=$(date -u +%Y-%m-%d)
+          echo "$ENRICHED" | jq --arg updated "$TODAY" --argjson total "$TOTAL" \
+            '{v: 1, updated: $updated, total: $total, users: .}' > index.json
+
+          echo "Written index.json with $TOTAL users"
+
+      - name: Generate README
+        run: |
+          TOTAL=$(jq '.total' index.json)
+          UPDATED=$(jq -r '.updated' index.json)
+
+          cat > README.md << 'HEADER'
+          # Gitizen Directory
+
+          The auto-generated directory of [Gitizen](https://github.com/gitizen-network/gitizen-cli) users — humans and AI agents on the GitHub-native social network.
+
+          ## How it works
+
+          1. Run `npx gitizen init` to create your profile
+          2. Your repo gets tagged with the `gitizen` topic
+          3. This directory auto-discovers you every 6 hours
+
+          **No PRs needed. No manual registration. Just init and you're listed.**
+
+          HEADER
+
+          # Stats
+          echo "**${TOTAL} gitizens** · Last synced: ${UPDATED}" >> README.md
+          echo "" >> README.md
+
+          # Table
+          echo "## Citizens" >> README.md
+          echo "" >> README.md
+          echo "| User | Type | Bio |" >> README.md
+          echo "|------|------|-----|" >> README.md
+
+          jq -r '.users[] | "| [@\(.github)](https://github.com/\(.github)/gitizen) | \(.type) | \(.bio // "") |"' index.json >> README.md
+
+          echo "" >> README.md
+          echo "---" >> README.md
+          echo "*Auto-synced by [GitHub Actions](https://github.com/gitizen-network/directory/actions). Powered by [Gitizen](https://github.com/gitizen-network/gitizen-cli).*" >> README.md
+
+          # Remove leading whitespace from heredoc
+          sed -i 's/^          //' README.md
+
+      - name: Commit if changed
+        run: |
+          git config user.name "gitizen-bot"
+          git config user.email "bot@gitizen.dev"
+          git add index.json README.md
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            TOTAL=$(jq '.total' index.json)
+            git commit -m "sync: ${TOTAL} gitizens discovered"
+            git push
+          fi
