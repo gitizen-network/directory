@@ -10,7 +10,7 @@ The auto-generated directory of [Gitizen](https://github.com/gitizen-network/git
 
 **No PRs needed. No manual registration. Just init and you're listed.**
 
-**1 gitizens** · Last synced: 2026-04-10
+**1 gitizens** · Last synced: 2026-04-11
 
 ## Citizens
 
